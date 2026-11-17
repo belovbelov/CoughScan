@@ -1,0 +1,250 @@
+# Сборка CoughScan и загрузка в TestFlight на облачном Mac GitHub.
+# Настройка секретов и порядок запуска: docs/testflight-github-actions.md
+
+name: TestFlight
+
+on:
+  # Кнопка «Run workflow» во вкладке Actions (появляется, когда файл есть в ветке по умолчанию).
+  workflow_dispatch:
+    inputs:
+      build_number:
+        description: "Номер сборки (пусто — 100 + номер запуска)"
+        required: false
+        default: ""
+  # Или push тега вида testflight-1.0-3 из любой ветки.
+  push:
+    tags:
+      - "testflight-*"
+
+concurrency:
+  group: testflight
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  testflight:
+    name: Build & upload
+    # Образ с Xcode 27 и iOS 27 SDK: проект создан в Xcode 27.1, минимальная версия iOS 27.0.
+    runs-on: xcode-27
+    timeout-minutes: 60
+    env:
+      XCODE_APP: /Applications/Xcode_27.1.app
+      PROJECT: CoughScan.xcodeproj
+      SCHEME: CoughScan
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check secrets
+        env:
+          IOS_DIST_CERT_P12_BASE64: ${{ secrets.IOS_DIST_CERT_P12_BASE64 }}
+          IOS_DIST_CERT_PASSWORD: ${{ secrets.IOS_DIST_CERT_PASSWORD }}
+          IOS_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_PROVISION_PROFILE_BASE64 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8_BASE64: ${{ secrets.ASC_KEY_P8_BASE64 }}
+        run: |
+          missing=0
+          for name in IOS_DIST_CERT_P12_BASE64 IOS_DIST_CERT_PASSWORD IOS_PROVISION_PROFILE_BASE64 \
+                      ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8_BASE64; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Не задан секрет $name (Settings → Secrets and variables → Actions)"
+              missing=1
+            fi
+          done
+          exit $missing
+
+      - name: Select Xcode
+        run: |
+          if [ -d "$XCODE_APP" ]; then sudo xcode-select -s "$XCODE_APP"; fi
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i iphoneos
+
+      - name: Regression checks
+        run: |
+          swiftc -parse-as-library CoughScan/Models.swift CoughScan/CoughStorage.swift \
+            CoughScan/AudioChunkWriter.swift Tests/RegressionChecks.swift -o "$RUNNER_TEMP/regression"
+          "$RUNNER_TEMP/regression"
+
+      - name: Install signing certificate and provisioning profile
+        env:
+          IOS_DIST_CERT_P12_BASE64: ${{ secrets.IOS_DIST_CERT_P12_BASE64 }}
+          IOS_DIST_CERT_PASSWORD: ${{ secrets.IOS_DIST_CERT_PASSWORD }}
+          IOS_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_PROVISION_PROFILE_BASE64 }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          CERT_PATH="$RUNNER_TEMP/dist.p12"
+          PROFILE_PATH="$RUNNER_TEMP/dist.mobileprovision"
+          PROFILE_PLIST="$RUNNER_TEMP/profile.plist"
+
+          printf '%s' "$IOS_DIST_CERT_P12_BASE64" | base64 --decode > "$CERT_PATH"
+          printf '%s' "$IOS_PROVISION_PROFILE_BASE64" | base64 --decode > "$PROFILE_PATH"
+
+          # Временная связка ключей только для этой сборки.
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$IOS_DIST_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+          rm -f "$CERT_PATH"
+
+          # Промежуточный сертификат Apple WWDR нужен codesign для построения цепочки.
+          if curl -fsSL https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer -o "$RUNNER_TEMP/wwdr.cer"; then
+            security import "$RUNNER_TEMP/wwdr.cer" -k "$KEYCHAIN_PATH" -t cert -f x509 > /dev/null 2>&1 || true
+          else
+            echo "::warning::Не удалось скачать AppleWWDRCAG3.cer, используем сертификаты образа"
+          fi
+
+          IDENTITY_SHA1="$(security find-identity -p codesigning "$KEYCHAIN_PATH" \
+            | grep -E '"(Apple|iPhone) Distribution' | head -n1 | awk '{print $2}' || true)"
+          if [ -z "$IDENTITY_SHA1" ]; then
+            echo "::error::В .p12 нет сертификата Apple Distribution с закрытым ключом"
+            security find-identity -p codesigning "$KEYCHAIN_PATH" || true
+            exit 1
+          fi
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -q "$IDENTITY_SHA1" \
+            || echo "::warning::Сертификат подписи не проходит проверку цепочки (истёк или отозван?)"
+
+          # Данные из профиля: команда, Bundle ID, имя, тип.
+          security cms -D -i "$PROFILE_PATH" > "$PROFILE_PLIST"
+          pb() { /usr/libexec/PlistBuddy -c "Print :$1" "$PROFILE_PLIST" 2>/dev/null || true; }
+          PROFILE_UUID="$(pb UUID)"
+          PROFILE_NAME="$(pb Name)"
+          TEAM_ID="$(pb TeamIdentifier:0)"
+          APP_ID="$(pb Entitlements:application-identifier)"
+          BUNDLE_ID="${APP_ID#"$TEAM_ID".}"
+          if [ -n "$(pb ProvisionedDevices)" ]; then
+            echo "::error::Профиль «$PROFILE_NAME» привязан к устройствам (Development/Ad Hoc). Нужен профиль типа App Store Connect."
+            exit 1
+          fi
+          case "$BUNDLE_ID" in
+            *'*'*) echo "::error::Профиль «$PROFILE_NAME» выпущен на wildcard App ID ($BUNDLE_ID). Нужен явный Bundle ID."; exit 1 ;;
+          esac
+
+          for dir in "$HOME/Library/MobileDevice/Provisioning Profiles" \
+                     "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+            mkdir -p "$dir"
+            cp "$PROFILE_PATH" "$dir/$PROFILE_UUID.mobileprovision"
+          done
+
+          echo "Профиль: $PROFILE_NAME ($PROFILE_UUID), команда $TEAM_ID, Bundle ID $BUNDLE_ID"
+          {
+            echo "KEYCHAIN_PATH=$KEYCHAIN_PATH"
+            echo "IDENTITY_SHA1=$IDENTITY_SHA1"
+            echo "PROFILE_UUID=$PROFILE_UUID"
+            echo "TEAM_ID=$TEAM_ID"
+            echo "BUNDLE_ID=$BUNDLE_ID"
+          } >> "$GITHUB_ENV"
+
+      - name: Choose build number
+        env:
+          INPUT_BUILD_NUMBER: ${{ github.event.inputs.build_number }}
+        run: |
+          BUILD_NUMBER="${INPUT_BUILD_NUMBER:-$((100 + GITHUB_RUN_NUMBER))}"
+          case "$BUILD_NUMBER" in
+            ''|*[!0-9.]*) echo "::error::Номер сборки должен состоять из цифр и точек: $BUILD_NUMBER"; exit 1 ;;
+          esac
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+          echo "Номер сборки: $BUILD_NUMBER"
+
+      - name: Archive
+        run: |
+          LOG="$RUNNER_TEMP/archive.log"
+          if ! xcodebuild archive \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath "$RUNNER_TEMP/CoughScan.xcarchive" \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            CODE_SIGN_IDENTITY="$IDENTITY_SHA1" \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_UUID" \
+            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            OTHER_CODE_SIGN_FLAGS="--keychain $KEYCHAIN_PATH" \
+            > "$LOG" 2>&1; then
+            grep -E "error:" "$LOG" | sort -u | head -n 40 || true
+            tail -n 40 "$LOG"
+            echo "::error::Архив не собран. Полный лог — archive.log в артефактах запуска."
+            exit 1
+          fi
+          grep -E "ARCHIVE SUCCEEDED" "$LOG"
+
+      - name: Export IPA
+        run: |
+          LOG="$RUNNER_TEMP/export.log"
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>export</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>teamID</key><string>${TEAM_ID}</string>
+            <key>signingCertificate</key><string>${IDENTITY_SHA1}</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>${BUNDLE_ID}</key><string>${PROFILE_UUID}</string>
+            </dict>
+            <key>uploadSymbols</key><true/>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+          </dict>
+          </plist>
+          EOF
+          if ! xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/CoughScan.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            > "$LOG" 2>&1; then
+            grep -E "error:" "$LOG" | sort -u | head -n 40 || true
+            tail -n 40 "$LOG"
+            echo "::error::IPA не экспортирован. Полный лог — export.log в артефактах запуска."
+            exit 1
+          fi
+          IPA="$(ls "$RUNNER_TEMP"/export/*.ipa 2>/dev/null | head -n1)"
+          test -n "$IPA" || { echo "::error::IPA не создан, см. export.log в артефактах"; exit 1; }
+          echo "IPA_PATH=$IPA" >> "$GITHUB_ENV"
+
+      - name: Upload to TestFlight
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8_BASE64: ${{ secrets.ASC_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+          KEY_DIR="$HOME/.appstoreconnect/private_keys"
+          mkdir -p "$KEY_DIR"
+          printf '%s' "$ASC_KEY_P8_BASE64" | base64 --decode > "$KEY_DIR/AuthKey_${ASC_KEY_ID}.p8"
+          xcrun altool --upload-app --type ios \
+            --file "$IPA_PATH" \
+            --apiKey "$ASC_KEY_ID" \
+            --apiIssuer "$ASC_ISSUER_ID"
+          echo "### Сборка $BUILD_NUMBER загружена в App Store Connect" >> "$GITHUB_STEP_SUMMARY"
+          echo "Через 10–30 минут она появится во вкладке TestFlight после обработки." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coughscan-build-logs-${{ github.run_number }}
+          path: |
+            ${{ runner.temp }}/archive.log
+            ${{ runner.temp }}/export.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Clean up signing material
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+          rm -rf "$HOME/.appstoreconnect/private_keys" "$RUNNER_TEMP/dist.mobileprovision" "$RUNNER_TEMP/profile.plist"
+          rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/"*.mobileprovision \
+                "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/"*.mobileprovision

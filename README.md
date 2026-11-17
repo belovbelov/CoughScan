@@ -30,6 +30,8 @@ swiftc -parse-as-library CoughScan/Models.swift CoughScan/CoughStorage.swift Cou
 
 ## TestFlight и App Store
 
+Без Xcode на своём компьютере: сборка и загрузка в TestFlight через GitHub Actions — см. [docs/testflight-github-actions.md](docs/testflight-github-actions.md).
+
 1. В Xcode открыть CoughScan.xcodeproj, выбрать свой Team и уникальный Bundle ID при необходимости. Для следующей загрузки увеличить build number, если 2 уже использован.
 2. Generic iOS Device → Product → Archive → Validate App → Distribute App → App Store Connect. Неподписанная локальная сборка не заменяет Validate App с учётной записью разработчика.
 3. На iPhone проверить: разрешение/отказ микрофона, старт/стоп, 10–30 минут мониторинга, блокировку экрана, звонок, подключение/отключение Bluetooth, отсутствие сети и последующее восстановление, перезапуск с очередью, очистку во время отправки, смену дня и CSV на iPad. При изменении аудиомаршрута запись останавливается с сообщением; повторный старт ручной.
